@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python File Flask Exercise</title>
+</head>
+<body>
+    <h1>{{ name }}</h1>  
+    <h2>{{ lst }}</h2>
+    <h3>{{ student }}</h3>
+
+    {% for num in lst %}
+    <li>{{ num }}</li>
+    {% endfor %}
+
+    {% for key,val in student.items() %}
+    <li>{{ key }} - {{ val }}</li>
+    {% endfor %}
+</body>
+</html>
