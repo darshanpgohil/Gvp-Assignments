@@ -1,0 +1,6 @@
+python -m venv my_venv
+.\my_venv\Scripts\activate
+
+python3 app.py
+
+pip install flask

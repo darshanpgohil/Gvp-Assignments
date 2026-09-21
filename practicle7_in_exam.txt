@@ -1,0 +1,134 @@
+class Course:
+
+    def __init__(self, code, day, start, end):
+        self.code = code
+        self.day = day
+        self.start = start
+        self.end = end
+
+    def __str__(self):
+        return self.code + " - " + self.day + " " + self.start + " to " + self.end
+
+
+class Student:
+
+    def __init__(self, student_id, name):
+        self.student_id = student_id
+        self.name = name
+        self.courses = []
+
+    def add_course(self, course):
+        self.courses.append(course)
+
+    def check_conflicts(self):
+
+        conflicts = []
+
+        for i in range(len(self.courses)):
+
+            for j in range(i + 1, len(self.courses)):
+
+                c1 = self.courses[i]
+                c2 = self.courses[j]
+
+                if c1.day == c2.day:
+
+                    if c1.start < c2.end and c2.start < c1.end:
+                        conflicts.append((c1, c2))
+
+        return conflicts
+
+    def __str__(self):
+
+        result = "\nStudent ID: " + str(self.student_id)
+        result += "\nStudent Name: " + self.name
+
+        result += "\nRegistered Courses:"
+
+        for course in self.courses:
+            result += "\n" + str(course)
+
+        return result
+
+
+# Main Program
+
+try:
+
+    n = int(input("Enter number of students: "))
+
+    students = []
+
+    for i in range(n):
+
+        print("\nEnter details of Student", i + 1)
+
+        student_id = input("Enter Student ID: ")
+        name = input("Enter Student Name: ")
+
+        student = Student(student_id, name)
+
+        number = int(input("Enter number of courses: "))
+
+        for j in range(number):
+
+            print("\nCourse", j + 1)
+
+            code = input("Enter Course Code: ")
+            day = input("Enter Day: ")
+            start = input("Enter Start Time (HH:MM): ")
+            end = input("Enter End Time (HH:MM): ")
+
+            # Convert time into minutes
+            start_time = int(start.split(":")[0]) * 60 + int(start.split(":")[1])
+            end_time = int(end.split(":")[0]) * 60 + int(end.split(":")[1])
+
+            if start_time >= end_time:
+                raise ValueError("Start time must be less than end time.")
+
+            course = Course(code, day, start_time, end_time)
+
+            # Store readable time also
+            course.start = start
+            course.end = end
+
+            student.add_course(course)
+
+        students.append(student)
+
+
+    # Display result
+
+    print("\n========== RESULT ==========")
+
+    for student in students:
+
+        print(student)
+
+        conflicts = student.check_conflicts()
+
+        print("\nTotal Registered Courses:", len(student.courses))
+
+        if len(conflicts) > 0:
+
+            print("\nConflicting Courses:")
+
+            for c1, c2 in conflicts:
+                print(c1.code, "<-- CONFLICT -->", c2.code)
+
+        else:
+
+            print("\nNo Conflict Found.")
+            print("Student Timetable:")
+
+            for course in student.courses:
+                print(course)
+
+
+except ValueError as e:
+
+    print("\nInvalid Input:", e)
+
+except Exception as e:
+
+    print("\nSomething went wrong:", e)
