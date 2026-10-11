@@ -6,9 +6,9 @@ if [ -d "$dir" ];
 then
        datetime=$(date +"%Y-%m-%d %H-%M-%S")
 
-       backup="$(backup_datetime)"
+       backup="$backup_$datetime.tar.gz"
 
-       tar -zcf "$backup" "$dir"
+       tar -czf "$backup" "$dir"
 
        echo "$backup File Created Successfully"
 else
