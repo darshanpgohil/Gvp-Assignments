@@ -1,17 +1,29 @@
 
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from datetime import datetime
+
+from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String,
+    Boolean, DateTime
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from pydantic import BaseModel, Field
-from typing import Optional, Literal
-from datetime import datetime, timedelta
-import secrets
-import hashlib
 
-app = FastAPI(title="Task Manager API", version="1.0.0")
 
-# SQLite Database
+app = FastAPI(title="Personal Task Tracker")
+
+# Session configuration
+app.add_middleware(
+    SessionMiddleware,
+    secret_key="replace-this-with-a-random-secret-key",
+    same_site="lax",
+    https_only=False  # Set True when deployed with HTTPS
+)
+
+# SQLite database
 DATABASE_URL = "sqlite:///./tasks.db"
 
 engine = create_engine(
@@ -26,14 +38,10 @@ SessionLocal = sessionmaker(
 )
 
 Base = declarative_base()
-
-# In-memory token store (development only)
-active_tokens = {}
-
-security = HTTPBearer(auto_error=False)
+templates = Jinja2Templates(directory="templates")
 
 
-# Database Model
+# Database model
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -43,13 +51,14 @@ class Task(Base):
     priority = Column(String(20), default="Medium")
     is_completed = Column(Boolean, default=False)
     created_by = Column(String(100), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
 
 
+# Create table automatically on startup/import
 Base.metadata.create_all(bind=engine)
 
 
-# Database Dependency
+# Database dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -58,280 +67,673 @@ def get_db():
         db.close()
 
 
-# Request Schemas
-class LoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=100)
-
-
-class TaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=150)
-    description: str = Field(default="", max_length=300)
-    priority: Literal["High", "Medium", "Low"] = "Medium"
-
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(default=None, min_length=1, max_length=150)
-    description: Optional[str] = Field(default=None, max_length=300)
-    priority: Optional[Literal["High", "Medium", "Low"]] = None
-
-
-class TaskResponse(BaseModel):
-    id: int
-    title: str
-    description: str
-    priority: str
-    is_completed: bool
-    created_by: str
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class ThemeRequest(BaseModel):
-    theme: Literal["light", "dark"]
-
-
-# Authentication
-def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
-):
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first"
-        )
-
-    token_hash = hashlib.sha256(
-        credentials.credentials.encode()
-    ).hexdigest()
-
-    username = active_tokens.get(token_hash)
+# Check logged-in user
+def get_username(request: Request):
+    username = request.session.get("username")
 
     if not username:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
+            status_code=401,
+            detail="Please login first"
         )
 
     return username
 
 
-# Health Check
-@app.get("/")
-def home():
-    return {"message": "Task Manager API is running"}
+# Only return tasks owned by the logged-in user
+def get_user_task(task_id: int, username: str, db: Session):
+    task = db.query(Task).filter(
+        Task.id == task_id,
+        Task.created_by == username
+    ).first()
 
-
-# Login
-@app.post("/login")
-def login(data: LoginRequest):
-    username = data.username.strip()
-
-    if not username:
+    if task is None:
         raise HTTPException(
-            status_code=400,
-            detail="Username cannot be empty"
+            status_code=404,
+            detail="Task not found"
         )
 
-    token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-    active_tokens[token_hash] = username
-
-    return {
-        "message": "Login successful",
-        "access_token": token,
-        "token_type": "bearer",
-        "username": username
-    }
+    return task
 
 
-# Logout
-@app.post("/logout")
-def logout(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+# GET /
+@app.get("/")
+def home(request: Request, db: Session = Depends(get_db)):
+    username = request.session.get("username")
+
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+
+    tasks = db.query(Task).filter(
+        Task.created_by == username
+    ).order_by(Task.id.desc()).all()
+
+    pending_tasks = [t for t in tasks if not t.is_completed]
+    completed_tasks = [t for t in tasks if t.is_completed]
+
+    theme = request.cookies.get("theme", "light")
+    if theme not in ("light", "dark"):
+        theme = "light"
+
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={
+            "username": username,
+            "pending_tasks": pending_tasks,
+            "completed_tasks": completed_tasks,
+            "theme": theme
+        }
+    )
+
+
+# GET /login
+@app.get("/login")
+def login_page(request: Request):
+    if request.session.get("username"):
+        return RedirectResponse("/", status_code=303)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={"error": None}
+    )
+
+
+# POST /login
+@app.post("/login")
+def login(
+    request: Request,
+    username: str = Form(...)
 ):
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Token required")
+    username = username.strip()
 
-    token_hash = hashlib.sha256(
-        credentials.credentials.encode()
-    ).hexdigest()
+    if not username or len(username) > 100:
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={"error": "Enter a name up to 100 characters."},
+            status_code=400
+        )
 
-    if token_hash not in active_tokens:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    # Clear old session data before logging in
+    request.session.clear()
+    request.session["username"] = username
 
-    del active_tokens[token_hash]
-
-    return {"message": "Logout successful"}
+    return RedirectResponse("/", status_code=303)
 
 
-# Create Task
-@app.post(
-    "/tasks",
-    response_model=TaskResponse,
-    status_code=status.HTTP_201_CREATED
-)
-def create_task(
-    data: TaskCreate,
-    username: str = Depends(get_current_user),
+# POST /add
+@app.post("/add")
+def add_task(
+    request: Request,
+    title: str = Form(...),
+    description: str = Form(""),
+    priority: str = Form("Medium"),
     db: Session = Depends(get_db)
 ):
-    title = data.title.strip()
+    username = get_username(request)
 
-    if not title:
-        raise HTTPException(status_code=422, detail="Title is required")
+    title = title.strip()
+    description = description.strip()
+
+    if not title or len(title) > 150:
+        raise HTTPException(
+            status_code=400,
+            detail="Title must contain 1-150 characters."
+        )
+
+    if len(description) > 300:
+        raise HTTPException(
+            status_code=400,
+            detail="Description cannot exceed 300 characters."
+        )
+
+    if priority not in ("High", "Medium", "Low"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid priority."
+        )
 
     task = Task(
         title=title,
-        description=data.description.strip(),
-        priority=data.priority,
+        description=description,
+        priority=priority,
         is_completed=False,
-        created_by=username
+        created_by=username,
+        created_at=datetime.now()
     )
 
     db.add(task)
     db.commit()
-    db.refresh(task)
 
-    return task
-
-
-# Get All Tasks
-@app.get("/tasks", response_model=list[TaskResponse])
-def get_tasks(
-    completed: Optional[bool] = None,
-    username: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    query = db.query(Task).filter(Task.created_by == username)
-
-    if completed is not None:
-        query = query.filter(Task.is_completed == completed)
-
-    return query.order_by(Task.id.desc()).all()
+    return RedirectResponse("/", status_code=303)
 
 
-# Get Single Task
-@app.get("/tasks/{task_id}", response_model=TaskResponse)
-def get_task(
-    task_id: int,
-    username: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.created_by == username
-    ).first()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return task
-
-
-# Update Task
-@app.patch("/tasks/{task_id}", response_model=TaskResponse)
-def update_task(
-    task_id: int,
-    data: TaskUpdate,
-    username: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.created_by == username
-    ).first()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    updates = data.model_dump(exclude_unset=True)
-
-    if "title" in updates:
-        if updates["title"] is None or not updates["title"].strip():
-            raise HTTPException(status_code=422, detail="Title cannot be empty")
-        task.title = updates["title"].strip()
-
-    if "description" in updates and updates["description"] is not None:
-        task.description = updates["description"].strip()
-
-    if "priority" in updates and updates["priority"] is not None:
-        task.priority = updates["priority"]
-
-    db.commit()
-    db.refresh(task)
-
-    return task
-
-
-# Toggle Task Completion
-@app.patch("/tasks/{task_id}/toggle", response_model=TaskResponse)
+# GET /toggle/{id}
+@app.get("/toggle/{id}")
 def toggle_task(
-    task_id: int,
-    username: str = Depends(get_current_user),
+    id: int,
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.created_by == username
-    ).first()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    username = get_username(request)
+    task = get_user_task(id, username, db)
 
     task.is_completed = not task.is_completed
-
     db.commit()
-    db.refresh(task)
 
-    return task
+    return RedirectResponse("/", status_code=303)
 
 
-# Delete Task
-@app.delete("/tasks/{task_id}")
-def delete_task(
-    task_id: int,
-    username: str = Depends(get_current_user),
+# GET /edit/{id}
+@app.get("/edit/{id}")
+def edit_page(
+    id: int,
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.created_by == username
-    ).first()
+    username = get_username(request)
+    task = get_user_task(id, username, db)
 
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    return templates.TemplateResponse(
+        request=request,
+        name="edit.html",
+        context={"task": task, "username": username}
+    )
+
+
+# POST /update/{id}
+@app.post("/update/{id}")
+def update_task(
+    id: int,
+    request: Request,
+    title: str = Form(...),
+    description: str = Form(""),
+    priority: str = Form("Medium"),
+    db: Session = Depends(get_db)
+):
+    username = get_username(request)
+    task = get_user_task(id, username, db)
+
+    title = title.strip()
+    description = description.strip()
+
+    if not title or len(title) > 150:
+        raise HTTPException(
+            status_code=400,
+            detail="Title must contain 1-150 characters."
+        )
+
+    if len(description) > 300:
+        raise HTTPException(
+            status_code=400,
+            detail="Description cannot exceed 300 characters."
+        )
+
+    if priority not in ("High", "Medium", "Low"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid priority."
+        )
+
+    task.title = title
+    task.description = description
+    task.priority = priority
+
+    db.commit()
+
+    return RedirectResponse("/", status_code=303)
+
+
+# POST /delete/{id}
+@app.post("/delete/{id}")
+def delete_task(
+    id: int,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    username = get_username(request)
+    task = get_user_task(id, username, db)
 
     db.delete(task)
     db.commit()
 
-    return {"message": "Task deleted successfully", "task_id": task_id}
+    return RedirectResponse("/", status_code=303)
 
 
-# Theme API (in-memory, development only)
-user_themes = {}
+# GET /set-theme/{theme}
+@app.get("/set-theme/{theme}")
+def set_theme(request: Request, theme: str):
+    get_username(request)
+
+    if theme not in ("light", "dark"):
+        raise HTTPException(
+            status_code=400,
+            detail="Theme must be light or dark."
+        )
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        key="theme",
+        value=theme,
+        max_age=60 * 60 * 24 * 365,
+        httponly=True,
+        samesite="lax",
+        secure=False  # Set True when deployed with HTTPS
+    )
+
+    return response
 
 
-@app.put("/theme")
-def set_theme(
-    data: ThemeRequest,
-    username: str = Depends(get_current_user)
-):
-    user_themes[username] = data.theme
-
-    return {
-        "username": username,
-        "theme": data.theme
-    }
+# GET /logout
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
-@app.get("/theme")
-def get_theme(
-    username: str = Depends(get_current_user)
-):
-    return {
-        "username": username,
-        "theme": user_themes.get(username, "light")
-    }
+========================================== login.html ======================================================================
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login - Task Tracker</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #dbeafe, #ede9fe);
+            color: #1e293b;
+        }
+        .card {
+            width: 100%;
+            max-width: 400px;
+            padding: 32px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 12px 35px #33415520;
+        }
+        h1 { margin-top: 0; }
+        p { color: #64748b; }
+        label { display: block; margin: 20px 0 8px; }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        button {
+            width: 100%;
+            margin-top: 18px;
+            padding: 12px;
+            border: 0;
+            border-radius: 8px;
+            background: #4f46e5;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .error { color: #dc2626; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <h1>📝 Task Tracker</h1>
+        <p>Log in to manage your daily tasks.</p>
+
+        {% if error %}
+            <p class="error">{{ error }}</p>
+        {% endif %}
+
+        <form action="/login" method="post">
+            <label for="username">Your name</label>
+            <input
+                id="username"
+                name="username"
+                type="text"
+                maxlength="100"
+                required
+                placeholder="Enter your name"
+            >
+            <button type="submit">Login</button>
+        </form>
+    </main>
+</body>
+</html>
+
+======================================================== index.html =========================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>My Tasks - Task Tracker</title>
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f1f5f9;
+            color: #0f172a;
+            transition: background .2s, color .2s;
+        }
+        body.dark { background: #0f172a; color: #e2e8f0; }
+        .container { max-width: 1000px; margin: auto; padding: 24px; }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 25px;
+        }
+        h1 { margin: 0 0 8px; }
+        h2 { margin-top: 28px; }
+        .muted { color: #64748b; }
+        .dark .muted { color: #94a3b8; }
+        a { color: #4f46e5; text-decoration: none; }
+        .dark a { color: #a5b4fc; }
+        .button, button {
+            display: inline-block;
+            border: 0;
+            border-radius: 8px;
+            padding: 10px 14px;
+            background: #4f46e5;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            text-decoration: none;
+        }
+        .logout { background: #64748b; }
+        .danger { background: #dc2626; }
+        .complete { background: #059669; }
+        .panel, .task {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .dark .panel, .dark .task {
+            background: #1e293b;
+            border-color: #334155;
+        }
+        label { display: block; margin: 12px 0 6px; }
+        input, textarea, select {
+            width: 100%;
+            padding: 11px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            background: white;
+            color: #0f172a;
+            font: inherit;
+        }
+        textarea { min-height: 85px; resize: vertical; }
+        .dark input, .dark textarea, .dark select {
+            background: #0f172a;
+            color: #e2e8f0;
+            border-color: #475569;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 14px;
+        }
+        .task h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
+        .task p { overflow-wrap: anywhere; }
+        .task-top {
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+        .actions form { margin: 0; }
+        .badge {
+            display: inline-block;
+            border-radius: 20px;
+            padding: 5px 9px;
+            font-size: 12px;
+            background: #e0e7ff;
+            color: #3730a3;
+        }
+        .High { background: #fee2e2; color: #991b1b; }
+        .Medium { background: #fef3c7; color: #92400e; }
+        .Low { background: #dcfce7; color: #166534; }
+        .empty { padding: 18px 0; }
+        @media (max-width: 600px) {
+            .container { padding: 15px; }
+            .form-grid { grid-template-columns: 1fr; }
+            .panel, .task { padding: 15px; }
+        }
+    </style>
+</head>
+
+<body class="{{ 'dark' if theme == 'dark' else '' }}">
+<div class="container">
+
+    <header>
+        <div>
+            <h1>📝 Personal Task Tracker</h1>
+            <div class="muted">Welcome, {{ username }}!</div>
+        </div>
+
+        <div class="actions">
+            <a class="button" href="/set-theme/{{ 'light' if theme == 'dark' else 'dark' }}">
+                {{ '☀️ Light mode' if theme == 'dark' else '🌙 Dark mode' }}
+            </a>
+            <a class="button logout" href="/logout">Logout</a>
+        </div>
+    </header>
+
+    <section class="panel">
+        <h2 style="margin-top:0">➕ Add a New Task</h2>
+
+        <form action="/add" method="post">
+            <label for="title">Task title</label>
+            <input
+                id="title" name="title" maxlength="150"
+                placeholder="e.g. Complete Python Assignment"
+                required
+            >
+
+            <label for="description">Description</label>
+            <textarea
+                id="description" name="description" maxlength="300"
+                placeholder="Enter task details"
+            ></textarea>
+
+            <div class="form-grid">
+                <div>
+                    <label for="priority">Priority</label>
+                    <select id="priority" name="priority">
+                        <option value="High">High</option>
+                        <option value="Medium" selected>Medium</option>
+                        <option value="Low">Low</option>
+                    </select>
+                </div>
+                <div style="align-self:end">
+                    <button type="submit" style="width:100%">Add Task</button>
+                </div>
+            </div>
+        </form>
+    </section>
+
+    <section>
+        <h2>⏳ Pending Tasks ({{ pending_tasks|length }})</h2>
+
+        {% for task in pending_tasks %}
+        <article class="task">
+            <div class="task-top">
+                <div>
+                    <h3>{{ task.title }}</h3>
+                    <span class="badge {{ task.priority }}">
+                        {{ task.priority }} Priority
+                    </span>
+                </div>
+                <span class="muted">#{{ task.id }}</span>
+            </div>
+
+            <p>{{ task.description or 'No description provided.' }}</p>
+            <small class="muted">
+                Created: {{ task.created_at.strftime('%d-%m-%Y %I:%M %p') }}
+            </small>
+
+            <div class="actions">
+                <a class="button complete" href="/toggle/{{ task.id }}">
+                    ✓ Mark Completed
+                </a>
+                <a class="button" href="/edit/{{ task.id }}">Edit</a>
+
+                <form action="/delete/{{ task.id }}" method="post"
+                      onsubmit="return confirm('Delete this task?')">
+                    <button class="danger" type="submit">Delete</button>
+                </form>
+            </div>
+        </article>
+        {% else %}
+        <p class="empty muted">No pending tasks. Add a new task above!</p>
+        {% endfor %}
+    </section>
+
+    <section>
+        <h2>✅ Completed Tasks ({{ completed_tasks|length }})</h2>
+
+        {% for task in completed_tasks %}
+        <article class="task">
+            <div class="task-top">
+                <div>
+                    <h3>{{ task.title }}</h3>
+                    <span class="badge {{ task.priority }}">
+                        {{ task.priority }} Priority
+                    </span>
+                </div>
+                <span class="muted">#{{ task.id }}</span>
+            </div>
+
+            <p>{{ task.description or 'No description provided.' }}</p>
+            <small class="muted">
+                Created: {{ task.created_at.strftime('%d-%m-%Y %I:%M %p') }}
+            </small>
+
+            <div class="actions">
+                <a class="button" href="/toggle/{{ task.id }}">
+                    ↩ Mark Pending
+                </a>
+                <a class="button" href="/edit/{{ task.id }}">Edit</a>
+
+                <form action="/delete/{{ task.id }}" method="post"
+                      onsubmit="return confirm('Delete this task?')">
+                    <button class="danger" type="submit">Delete</button>
+                </form>
+            </div>
+        </article>
+        {% else %}
+        <p class="empty muted">No completed tasks yet.</p>
+        {% endfor %}
+    </section>
+
+</div>
+</body>
+</html>
+
+====================================================== edit.html ============================================================
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Edit Task - Task Tracker</title>
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background: #f1f5f9;
+            color: #0f172a;
+            font-family: Arial, sans-serif;
+        }
+        .card {
+            width: 100%;
+            max-width: 600px;
+            background: white;
+            padding: 28px;
+            border-radius: 14px;
+            box-shadow: 0 8px 30px #0f172a12;
+        }
+        label { display: block; margin: 15px 0 7px; }
+        input, textarea, select {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            font: inherit;
+        }
+        textarea { min-height: 100px; }
+        button, .back {
+            display: inline-block;
+            padding: 11px 15px;
+            border: 0;
+            border-radius: 8px;
+            background: #4f46e5;
+            color: white;
+            text-decoration: none;
+            cursor: pointer;
+            margin-top: 18px;
+        }
+        .back { background: #64748b; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <h1>✏️ Edit Task</h1>
+        <p>Logged in as {{ username }}</p>
+
+        <form action="/update/{{ task.id }}" method="post">
+            <label for="title">Task title</label>
+            <input
+                id="title"
+                name="title"
+                maxlength="150"
+                value="{{ task.title }}"
+                required
+            >
+
+            <label for="description">Description</label>
+            <textarea
+                id="description"
+                name="description"
+                maxlength="300"
+            >{{ task.description or '' }}</textarea>
+
+            <label for="priority">Priority</label>
+            <select id="priority" name="priority">
+                <option value="High" {% if task.priority == 'High' %}selected{% endif %}>High</option>
+                <option value="Medium" {% if task.priority == 'Medium' %}selected{% endif %}>Medium</option>
+                <option value="Low" {% if task.priority == 'Low' %}selected{% endif %}>Low</option>
+            </select>
+
+            <button type="submit">Save Changes</button>
+            <a class="back" href="/">Cancel</a>
+        </form>
+    </main>
+</body>
+</html>
